@@ -1,0 +1,121 @@
+---
+title: "624-Project2"
+author: "Ahmed Elsaeyed"
+date: "2024-11-13"
+output: html_document
+---
+
+```{r include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE) 
+
+library(readxl)
+library(corrplot)
+library(reshape2)
+library(ggplot2)
+library(dplyr)
+
+
+```
+
+
+# Part 1: Explore Beverage Data
+
+Taking a look at the data:
+```{r  }
+
+bev_data <- read_excel("/Users/aelsaeyed/Downloads/StudentData.xlsx")
+
+head(bev_data)
+
+```
+
+```{r }
+summary(bev_data)
+
+```
+
+```{r }
+str(bev_data)
+```
+
+```{r }
+colSums(is.na(bev_data))
+
+```
+
+
+```{r }
+#General corr matrix
+numeric_vars <- bev_data %>% select(where(is.numeric))
+
+cor_matrix <- cor(numeric_vars, use = "complete.obs")
+
+cor_data <- melt(cor_matrix)
+
+ggplot(cor_data, aes(x = Var1, y = Var2, fill = value)) +
+  geom_tile(color = "white") +
+  scale_fill_gradient2(
+    low = "blue", high = "red", mid = "white",
+    midpoint = 0, limit = c(-1, 1), space = "Lab",
+    name = "Pearson\nCorrelation"
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(
+      angle = 45, vjust = 1, size = 10, hjust = 1
+    )
+  ) +
+  coord_fixed()
+```
+
+
+
+
+```{r }
+# Checking out only vars strongly correlated with PH
+ph_correlations <- cor_matrix[, "PH"]
+strong_corr_vars <- names(ph_correlations[abs(ph_correlations) >= 0.3])
+
+strong_cor_matrix <- cor_matrix[strong_corr_vars, strong_corr_vars]
+
+strong_cor_data <- melt(strong_cor_matrix)
+
+ggplot(strong_cor_data, aes(x = Var1, y = Var2, fill = value)) +
+  geom_tile(color = "white") +
+  scale_fill_gradient2(
+    low = "blue", high = "red", mid = "white",
+    midpoint = 0, limit = c(-1, 1), space = "Lab",
+    name = "Pearson\nCorrelation"
+  ) +
+  geom_text(aes(label = round(value, 2)), color = "black", size = 4) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(
+      angle = 45, vjust = 1, size = 10, hjust = 1
+    )
+  ) +
+  coord_fixed()
+```
+
+
+Next steps:
+Clean
+Impute 
+Remove variables (find colinear vars etc)
+Train/test several models 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
