@@ -1,0 +1,481 @@
+---
+title: "624-Project2-V2"
+author: "Ahmed Elsaeyed"
+date: "2024-12-10"
+output: html_document
+---
+
+```{r include=FALSE}
+
+# Checking out packages
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE) 
+
+library(corrplot)
+library(reshape2)  # for melt
+library(ggplot2)   # for ggplot
+library(dplyr)
+library(knitr)
+library(magrittr)
+library(tidyverse) # for code with missing values
+library(caret)     # for models
+library(RANN)      # for better kNN imputation
+library(gridExtra) # for Outliers
+library(car)       # VIF
+library(kernlab)   # SVM model
+library(xgboost)   # XGBoost model
+library(factoextra) # For advanced plotting
+
+```
+
+<br>
+<hr>
+<br>
+
+# Data
+
+Here we import our train and test data, `student_train` and `student_eval`, and evaluate for missing data and additional exploratory steps.
+
+<br>
+
+## Data Acquisition
+
+Here we can preview the data structure:
+
+```{r}
+
+student_train = read.csv('https://raw.githubusercontent.com/deepasharma06/Data-624/refs/heads/main/StudentData_training.csv')
+
+student_eval = read.csv('https://raw.githubusercontent.com/deepasharma06/Data-624/refs/heads/main/StudentEvaluation_test.csv')
+
+head(student_train) %>% kable()
+
+```
+
+```{r}
+
+# Produce the model that can impute values using kNN
+imputeModel <- preProcess(student_train, method = c("knnImpute"))
+
+# Impute the missing values for the training and test data
+student_train <- predict(imputeModel, student_train)
+student_eval <- predict(imputeModel, student_eval)
+
+# There are now zero NA values in our train and test data
+sum(is.na(student_train))
+sum(is.na(student_eval))
+
+```
+
+```{r}
+
+# Remove problematic predictors from train and test data
+student_train_x <- subset(student_train, select = -c(Hyd.Pressure1))
+student_eval_y <-  subset(student_eval, select =  -c(Hyd.Pressure1))
+
+
+```
+
+```{r}
+
+# Replacing Brand.Code with BCB
+student_train_x1 <- student_train_x |> mutate(BCB = as.numeric(Brand.Code =='B')) |> select(-Brand.Code)
+student_eval_y1 <- student_eval_y |> mutate(BCB = as.numeric(Brand.Code =='B')) |> select(-Brand.Code)
+
+# New model with BCB instead of Brand.Code
+model <- lm(PH ~ ., data = student_train_x)
+#summary(model)
+
+# Calculating VIF
+vif_values <- vif(model)
+vif_values
+
+```
+
+```{r}
+
+# Create new predictor PT
+student_train_x2 <- student_train_x1 |> mutate(PT = Balling.Lvl/Balling) |> select(-c(Balling, Balling.Lvl))
+student_eval_y2 <- student_eval_y1 |> mutate(PT = Balling.Lvl/Balling) |> select(-c(Balling, Balling.Lvl))
+
+```
+
+
+Now I will use PCR/PLS for further feature reduction. 
+
+1. Do PCR and analyze (rsquared) 
+2. Do PLS, get optimal number of components using RMSEP, do PCR and analyze (rsquared) 
+
+```{r }
+# Separate predictors and response
+X_train <- student_train_x2 %>% select(-PH)
+y_train <- student_train_x2$PH
+
+X_test <- student_eval_y2 %>% select(-PH)
+y_test <- student_eval_y2$PH
+
+# Scale the training and test sets
+# We'll use caret's preProcess for scaling
+preProcValues <- preProcess(X_train, method = c("center", "scale"))
+X_train_scaled <- predict(preProcValues, X_train)
+X_test_scaled  <- predict(preProcValues, X_test)
+
+# Perform PCA on the scaled training predictors
+pca_result <- prcomp(X_train_scaled, center = FALSE, scale. = FALSE)
+
+# Summary of PCA variance
+summary(pca_result)
+```
+
+The principal components are chosen based on max variability, we can crack open PC1 and PC2 to see which variables cover the widest range of variability and get a sense for how PCR would reduce multi-collinearity:
+```{r }
+# Contributions to PC1
+fviz_contrib(pca_result, choice = "var", axes = 1, top = 10) +
+  labs(title = "Contributions of Variables to PC1")
+```
+
+```{r }
+# Contributions to PC1
+fviz_contrib(pca_result, choice = "var", axes = 2, top = 10) +
+  labs(title = "Contributions of Variables to PC2")
+
+```
+
+On to PCR: 
+```{r }
+library(pls)
+
+# Set a seed for reproducibility
+set.seed(123)
+
+# Using the already processed data 'student_train_x2'
+# Ensure that PH is the response and the rest are predictors
+pcr_model <- pcr(PH ~ ., data = student_train_x2, scale = TRUE,  validation = "CV")   
+
+# Summary of the PCR model
+summary(pcr_model)
+```
+
+```{r}
+# Plot the cross-validation results using validationplot()
+
+# val.type options: "MSEP", "RMSEP", "R2"
+validationplot(pcr_model, val.type = "RMSEP", main = "PCR Cross-Validation (RMSEP)")
+```
+
+```{r }
+# Print RMSEP for each number of components
+rmsep_values <- RMSEP(pcr_model, estimate = "CV")
+rmsep_values
+```
+
+```{r }
+# Also check R² to see how well the model explains the variance
+validationplot(pcr_model, val.type = "R2", main = "PCR Cross-Validation (R2)")
+```
+
+```{r }
+# Print out R2 for each number of components
+r2_values <- R2(pcr_model, estimate = "CV")
+r2_values
+```
+
+It looks like 5 components gives us both the highest R2 and lowest RMSEP before the model sharply drops in performance. It does improve again at 20 components, but for the sake of having a simpler model we will stick to 5. 
+
+```{r }
+library(pls)
+
+# Set a seed for reproducibility
+set.seed(123)
+
+# Fit the PCR model with exactly 5 components
+pcr_model_5 <- pcr(PH ~ ., 
+                   data = student_train_x2, 
+                   scale = TRUE, 
+                   ncomp = 5, 
+                   validation = "CV")
+
+# Print summary of the model
+summary(pcr_model_5)
+
+# Extract R2 and RMSEP for cross-validation
+r2_5 <- R2(pcr_model_5, estimate = "CV")
+rmsep_5 <- RMSEP(pcr_model_5, estimate = "CV")
+
+
+# If you have a test set (student_eval_y2) and want to make predictions:
+
+predictions_5 <- predict(pcr_model_5, newdata = student_eval_y2, ncomp = 5)
+  
+# Calculate prediction metrics on the test set
+test_res <- postResample(predictions_5, student_eval_y2$PH)
+cat("\nTest set performance (using 5 components):\n")
+print(test_res)
+
+    # RMSE       0.6155150 
+    # Rsquared   0.2832964
+    # MAE        0.5087567 
+```
+
+
+The results with PCR are lackluster, on to PLS:
+
+```{r }
+library(pls)
+
+set.seed(123) # For reproducibility
+
+# 1. Make the PLS model using cross-validation
+pls_model <- plsr(PH ~ ., 
+                  data = student_train_x2,
+                  scale = TRUE,          # Scale predictors
+                  validation = "CV")     # Use cross-validation
+
+# Print a summary of the model to see initial info
+summary(pls_model)
+```
+
+```{r }
+# Using validationplot to check RMSEP across components
+validationplot(pls_model, val.type = "RMSEP", main = "PLS: CV RMSEP by Number of Components")
+# This plot helps visualize how RMSEP changes as we increase the number of components.
+```
+
+```{r }
+validationplot(pls_model, val.type = "R2", main = "PLS: CV R2 by Number of Components")
+
+```
+
+```{r }
+# Check R² via R2() function and RMSEP via RMSEP() function
+r2_values_pls <- R2(pls_model, estimate = "CV")
+rmsep_values_pls <- RMSEP(pls_model, estimate = "CV")
+```
+
+```{r }
+r2_values <- r2_values_pls$val["CV", "PH", ]
+r2_comps <- r2_values[-1]
+
+rmse_values <- rmsep_values_pls$val["CV", "PH", ]
+rmsep_comps <- rmse_values[-1]
+```
+
+```{r }
+# Identify the best number of components based on minimum RMSEP
+opt_comp_rmsep <- which.min(rmsep_comps)
+min_rmsep <- rmsep_comps[opt_comp_rmsep]
+
+# Identify the best number of components based on max R²
+opt_comp_r2 <- which.max(r2_comps)
+max_r2 <- r2_comps[opt_comp_r2]
+
+cat("\nOptimal number of components based on RMSEP:", opt_comp_rmsep, "with RMSEP =", min_rmsep, "\n")
+cat("Optimal number of components based on R²:", opt_comp_r2, "with R² =", max_r2, "\n")
+
+# Let's choose the optimal number of components. In practice, you might consider a balance 
+# between minimal RMSEP and complexity. Here, let's use the one chosen by RMSEP for demonstration.
+final_ncomp <- opt_comp_rmsep
+
+cat("\nFinal chosen number of components:", final_ncomp, "\n")
+
+# 4. Make a final PLS model with the chosen number of components and evaluate it
+pls_model_final <- plsr(PH ~ ., 
+                        data = student_train_x2,
+                        scale = TRUE,
+                        ncomp = final_ncomp,
+                        validation = "none") # no need for CV here since we fixed ncomp
+
+# Summary of the final model
+summary(pls_model_final)
+
+preds_pls <- predict(pls_model_final, newdata = student_eval_y2, ncomp = final_ncomp)
+  
+results_test <- postResample(preds_pls, student_eval_y2$PH)
+cat("\nTest set performance with", final_ncomp, "components:\n")
+print(results_test)
+
+# RMSE     0.5593341
+# Rsquared 0.4342728       
+# MAE      0.4397250
+```
+
+X-Loadings:
+Indicate how the original predictors are combined linearly to form the PLS components. A higher absolute loading value means the predictor strongly influences that component.
+```{r }
+# View the X-loadings
+x_loadings <- pls_model_final$loadings
+cat("X-loadings:\n")
+# print(x_loadings)
+
+# View the X-loading weights
+x_loading_weights <- pls_model_final$loading.weights
+cat("\nX-loading weights:\n")
+# print(x_loading_weights)
+
+# Convert to data frames for easier handling
+x_loadings_matrix <- unclass(pls_model_final$loadings)
+x_loadings_df <- as.data.frame(x_loadings_matrix)
+
+x_loadings_weights_matrix <- unclass(pls_model_final$loading.weights)
+x_loading_weights_df <- as.data.frame(x_loadings_matrix)
+
+# Rename columns for clarity: each column corresponds to a component
+colnames(x_loadings_df) <- paste0("Comp", 1:ncol(x_loadings_df))
+colnames(x_loading_weights_df) <- paste0("Comp", 1:ncol(x_loading_weights_df))
+
+# Let's also see the coefficients for each number of components
+coefficients_array <- pls_model_final$coefficients
+# `coefficients_array` is a multidimensional array: [predictor, response, component]
+# For a single response model, we can simplify it:
+coefficients_matrix <- coefficients_array[,1,] # Extract for the single response variable
+colnames(coefficients_matrix) <- paste0("Comp", 1:ncol(coefficients_matrix))
+
+cat("\nCoefficients for each component:\n")
+#print(coefficients_matrix)
+
+# Visualizing Loadings
+# As with PCA, you can plot the loadings to see which predictors have strong influence on each component.
+library(reshape2)
+library(ggplot2)
+
+# Melt the loadings data frame for plotting
+x_loadings_long <- melt(x_loadings_df, variable.name = "Component", value.name = "Loading")
+x_loadings_long$Variable <- rownames(x_loadings_df)
+
+ggplot(x_loadings_long, aes(x = reorder(Variable, Loading), y = Loading, fill = Component)) +
+  geom_bar(stat="identity", position="dodge") +
+  coord_flip() +
+  facet_wrap(~ Component, scales = "free_y") +
+  theme_minimal() +
+  labs(title = "PLS X-Loadings by Component", x = "Predictors", y = "Loading")
+
+
+```
+
+Coefficients:
+Show how each predictor contributes to predicting the response variable when using a given number of components. Higher absolute coefficients indicate greater influence of a predictor on the predicted outcome.
+
+```{r }
+# Extract the coefficients matrix from the PLS model
+coefficients_array <- pls_model_final$coefficients
+coefficients_matrix <- coefficients_array[, 1, ] # For a single-response model
+colnames(coefficients_matrix) <- paste0("Comp", 1:ncol(coefficients_matrix))
+
+# Convert to a data frame
+coefficients_df <- as.data.frame(coefficients_matrix)
+coefficients_df$Variable <- rownames(coefficients_df)
+
+# Reshape to long format for plotting
+library(reshape2)
+coefficients_long <- melt(coefficients_df, id.vars = "Variable", 
+                          variable.name = "Component", value.name = "Coefficient")
+
+# Plot using ggplot2, faceting by Component
+library(ggplot2)
+ggplot(coefficients_long, aes(x = reorder(Variable, Coefficient), y = Coefficient, fill = Component)) +
+  geom_bar(stat="identity", position="dodge") +
+  coord_flip() +
+  facet_wrap(~ Component, scales = "free_y") +
+  theme_minimal() +
+  labs(title = "PLS Coefficients by Component",
+       x = "Predictor Variables",
+       y = "Coefficient") +
+  theme(legend.position = "none")
+
+```
+
+The good thing about using PLS is that the multi-colinearity is addressed along with predictive power. The components or latent variables are chosen such that the covariance between predictors is maximized, and each component is orthogonal to the ones prior so the correlation between components is also minimized. 
+
+Each predictor is also weighed differently in each component it appears in based on its effect on the target variable. 
+Some next steps we can take are to look at which predictors have consistently low coefficients/loadings and remove them- this could possibly improve the performance of the model. 
+
+PT:
+Coefficients: Around ±0.001 to ±0.007 across all components, never exceeding about 0.0075 in absolute value. These are very small relative to other variables that have coefficients in the 0.05–0.4 range.
+Loadings: PT does not appear to strongly load on any component (not listed or near zero in the given snippet).
+
+Air.Pressurer:
+Coefficients: About -0.003 to -0.013 across all components. These values are also quite small compared to other more influential variables.
+Loadings: Only appears once at about -0.114, which is not large. Most important variables have loadings at least above ±0.2–0.3 somewhere.
+
+Carb.Temp:
+Coefficients: Ranging around 0.0059 to 0.0158, slightly larger than PT or Air.Pressurer but still relatively small. Some variables show coefficients well above 0.05 or even 0.1.
+Loadings: Carb.Temp does not appear with a noticeable loading in the snippet (it’s blank), suggesting it may not be significantly influencing the latent structure.
+
+```{r }
+library(pls)
+
+# Remove the chosen predictors from the dataset
+predictors_to_remove <- c("PT", "Air.Pressurer", "Carb.Temp")
+
+student_train_reduced <- student_train_x2[ , !(names(student_train_x2) %in% predictors_to_remove)]
+
+# Fit a PLS model again with cross-validation
+set.seed(123)
+pls_model_reduced <- plsr(PH ~ ., 
+                          data = student_train_reduced,
+                          scale = TRUE,
+                          validation = "CV")
+
+# Check summary
+summary(pls_model_reduced)
+
+
+r2_values_reduced <- R2(pls_model_reduced, estimate = "CV")
+rmsep_values_reduced <- RMSEP(pls_model_reduced, estimate = "CV")
+
+
+
+cat("\nCross-validated R² values after removal:\n")
+cat("\nCross-validated RMSEP values after removal:\n")
+
+# Visualize MSEP to see if there's an improvement
+validationplot(pls_model_reduced, val.type = "MSEP", main = "PLS with Reduced Predictors: CV MSEP by #Components")
+
+# Identify optimal number of components in the reduced model based on RMSEP
+
+r2_values_reduced_mod <- r2_values_reduced$val["CV", "PH", ]
+r2_comps_reduced <- r2_values_reduced_mod[-1]
+
+rmse_values_reduced_mod <- rmsep_values_reduced$val["CV", "PH", ]
+rmsep_comps_reduced <- rmse_values_reduced_mod[-1]
+
+opt_comp_rmsep_reduced <- which.min(rmsep_comps_reduced)
+min_rmsep_reduced <- rmsep_comps_reduced[opt_comp_rmsep_reduced]
+opt_comp_r2_reduced <- which.max(r2_comps_reduced)
+max_r2_reduced <- r2_comps_reduced[opt_comp_r2_reduced]
+
+cat("\nAfter predictor removal:\n")
+cat("Optimal #Components by RMSEP:", opt_comp_rmsep_reduced, "with RMSEP =", min_rmsep_reduced, "\n")
+cat("Optimal #Components by R²:", opt_comp_r2_reduced, "with R² =", max_r2_reduced, "\n")
+
+```
+
+```{r }
+# Fit the final model with the chosen number of components
+final_pls_model <- plsr(PH ~ ., 
+                        data = student_train_reduced,
+                        scale = TRUE,
+                        ncomp = opt_comp_rmsep_reduced,
+                        validation = "none")
+
+# Check summary
+summary(final_pls_model)
+
+# Predict on the test set
+preds_final <- predict(final_pls_model, newdata = student_eval_y2, ncomp = opt_comp_rmsep_reduced)
+  
+test_performance <- postResample(preds_final, student_eval_y2$PH)
+cat("\nTest set performance (RMSE, R2, MAE):\n")
+print(test_performance)
+
+# RMSE      0.5562690
+# Rsquared  0.4452060
+# MAE        0.4302488 
+```
+
+There was a small lift in Rsquared after removing some of the less relevant predictors. 
+
+Rsquared: 
+
+PCR:  0.2832964
+PLS:  0.4342728
+PLS with some predictors removed: 0.4452060
